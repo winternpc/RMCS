@@ -84,21 +84,40 @@ public:
     }
 
     void update() override {
-        // RMCS Executor 会周期调用这个 update()。
+        dr16_.update_status();
+        // 把 uart_receive_callback() 之前保存的 DR16 原始数据，
+        // 解析成摇杆、拨杆、鼠标、键盘等实际状态。
         //
-        // 当前阶段暂时不做任何事情。
-        //
-        // 后面这里会逐步加入：
-        //
-        // 1. 更新电机反馈
-        // 2. 更新 DR16 状态
-        // 3. 读取遥控器摇杆
-        // 4. 摇杆映射成目标速度
-        // 5. 对电机速度进行低通滤波
-        // 6. 计算速度误差
-        // 7. 使用 PidCalculator 计算控制力矩
+        // RMCS Executor 会周期调用 update()，
+        // 因此 DR16 状态也会周期刷新。
     }
+    void uart_receive_callback(
+    const Spec::Uart& uart,
+    const View::Uart& data
+) override {
+    // 一块 RMCS Board 上不只有一个 UART，
+    // 所以首先判断：
+    // “这次收到的数据是不是来自 DR16 使用的 DBUS 串口？”
 
+    if (uart == Spec::kUarts.kDbus) {
+        dr16_.store_status(
+            data.uart_data.data(),
+            data.uart_data.size()
+        );
+
+        // uart_data.data()
+        // → UART 这一帧数据在内存中的起始位置。
+        //
+        // uart_data.size()
+        // → 这一帧一共有多少字节。
+        //
+        // store_status()
+        // → 把原始 DR16 数据先保存下来。
+        //
+        // 后面的 dr16_.update_status()
+        // 才会真正解析摇杆等状态。
+    }
+}
 private:
     std::unique_ptr<librmcs::board::RmcsBoardLite> board_;
     // RMCS 开发板通信对象。
