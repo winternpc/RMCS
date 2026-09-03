@@ -12,32 +12,16 @@ dr16_motor_control:
 
     velocity_filter_cutoff_hz: 10.0
 
-    # ------------------------------------------------------------
-    # M3508 速度 PID
-    # ------------------------------------------------------------
-
-    # 比例项
     velocity_kp: 0.05
-
-    # 第一轮先关闭积分
     velocity_ki: 0.0
-
-    # 第一轮先关闭微分
     velocity_kd: 0.0
 
-    # 积分累计范围
     velocity_integral_min: -100.0
     velocity_integral_max: 100.0
 
-    # 只有误差处于这个范围内时才允许积分
     velocity_integral_split_min: -10.0
     velocity_integral_split_max: 10.0
 
-    # PID 最终输出限制
-    #
-    # 当前先非常保守地限制：
-    # -0.5 ~ +0.5
-    #
-    # 目前还不会真正发送给电机。
-    velocity_output_min: -0.5
-    velocity_output_max: 0.5
+    # 第一次真实驱动先限制得小一点。
+    velocity_output_min: -0.2
+    velocity_output_max: 0.2
