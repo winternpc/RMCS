@@ -1,55 +1,83 @@
+#include <cstdint>
 #include <memory>
-// std::unique_ptr 和 std::make_unique 的定义。
-// 后面用它保存 CBoard 对象。
 
+// ROS2 Node。
+// 后面会通过 YAML 参数读取 board_serial、PID 参数等。
 #include <rclcpp/node.hpp>
-// ROS2 的 Node 定义。
-// 后面会从 YAML / ROS2 参数中读取开发板序列号、
-// 电机参数、PID 参数等。
 
+// RMCS Component 基类。
+// 继承以后，RMCS Executor 会周期调用 update()。
 #include <rmcs_executor/component.hpp>
-// RMCS 的 Component 基类。
-// 继承它之后，Dr16MotorControl 才能被 RMCS Executor 周期调用。
 
+// DR16 遥控器解析。
 #include "hardware/device/dr16.hpp"
-// RMCS 已经提供好的 DR16 遥控器解析类。
-// DBUS 原始数据会先交给它保存，再由 update_status() 解析。
 
+// DJI 电机封装。
+// 负责解析 M3508 的角度、转速、力矩、温度，
+// 后面还会负责生成 C620 的控制指令。
+#include "hardware/device/dji_motor.hpp"
+
+// 我们实际使用的开发板。
+// lsusb 已经确认：
+// VID = a11c
+// PID = d401
+// 对应 librmcs::board::CBoard。
 #include "librmcs/board/c_board.hpp"
-// CBoard 的主机端接口。
-//
-// 我们已经通过 lsusb 实际确认：
-//     VID = a11c
-//     PID = d401
-//
-// 而 CBoard 源码中使用的也是：
-//     0xA11C : 0xD401
-//
-// 所以我们手上的实物应该使用 CBoard，
-// 而不是之前误用的 RmcsBoardLite。
+
 
 namespace rmcs_core::hardware {
 
-// 这是我们为了第二周任务二编写的 hardware。
+// ============================================================
+// 第二周任务二：DR16 + M3508 电机控制 Hardware
+// ============================================================
 //
-// 当前阶段已经完成：
-// 1. RMCS Component
-// 2. ROS2 Node
-// 3. CBoard Callback
-// 4. CBoard USB 通信对象
-// 5. DR16 DBUS 数据接收
-// 6. 临时 CAN 电机反馈诊断
+// 当前已经完成：
 //
-// 暂时还没有正式加入：
-// 1. DjiMotor
-// 2. 摇杆 → 目标速度
-// 3. LowPassFilter
-// 4. PidCalculator
+// DR16
+//   ↓ DBUS
+// CBoard
+//   ↓
+// uart_receive_callback()
+//   ↓
+// dr16_.store_status()
+//   ↓
+// dr16_.update_status()
 //
-// 当前 CAN 回调中的日志只是临时诊断功能，
-// 用来确认：
-// 1. C620 当前 ID
-// 2. CAN1 是否能够收到电机反馈。
+//
+// M3508 + C620(ID = 3)
+//   ↓ CAN1 / 0x203
+// CBoard
+//   ↓
+// can_receive_callback()
+//   ↓
+// motor_.match_then_store_status()
+//   ↓
+// motor_.update_status()
+//   ↓
+// motor_.velocity()
+// motor_.angle()
+// motor_.temperature()
+//
+//
+// 当前还没有做：
+//
+// DR16 摇杆
+//      ↓
+// 目标速度
+//      ↓
+// LowPassFilter
+//      ↓
+// PID
+//      ↓
+// control_torque
+//      ↓
+// CAN 控制发送
+//
+// 所以当前版本依旧只是：
+//
+// “读取电机反馈”
+//
+// 不会主动让 M3508 转动。
 class Dr16MotorControl
     : public rmcs_executor::Component
     , public rclcpp::Node
@@ -59,106 +87,222 @@ public:
     Dr16MotorControl()
         : Node{
               get_component_name(),
-              // 使用 RMCS Component 的名字作为 ROS2 Node 名字。
 
               rclcpp::NodeOptions{}
                   .automatically_declare_parameters_from_overrides(true)
-              // 允许 YAML 中传入的参数自动声明。
-              //
-              // 例如：
-              //
-              // dr16_motor_control:
-              //   ros__parameters:
-              //     board_serial: ""
-              //
-              // 后面就可以直接：
-              //
-              // get_parameter("board_serial")
-              //
-              // 读取这个参数。
           } {
 
+        // ========================================================
+        // 配置 M3508
+        // ========================================================
+        //
+        // 我们已经实际测试得到：
+        //
+        // M3508 feedback connected:
+        // CAN1, ID = 0x203
+        //
+        // 对于 M3508：
+        //
+        // 接收反馈 CAN ID
+        // = 0x200 + 电调 ID
+        //
+        // 所以：
+        //
+        // 0x203
+        //   ↓
+        // C620 ID = 3
+        //
+        // 因此这里正式使用：
+        //
+        // M3508
+        // ID 3
+        motor_.configure(
+            device::DjiMotor::Config{
+                device::DjiMotor::Type::kM3508,
+                3
+            }
+        );
+
+
+        // ========================================================
+        // 创建 CBoard 通信对象
+        // ========================================================
         board_ = std::make_unique<librmcs::board::CBoard>(
             *this,
             get_parameter("board_serial").as_string()
         );
 
-        // ↑ 创建真正与 CBoard 通信的对象。
-        //
         // 第一个参数 *this：
-        // --------------------------------
-        // 把当前 Dr16MotorControl 自己作为 Callback
-        // 交给 CBoard。
         //
-        // 数据链可以理解成：
+        // 把当前 Dr16MotorControl 当成 CBoard Callback。
         //
-        // CBoard 收到 CAN / UART 数据
-        //             ↓
-        // librmcs
-        //             ↓
-        // 找到 Callback
-        //             ↓
-        // Dr16MotorControl
-        //             ↓
+        // CBoard 收到：
+        //
+        // DBUS
+        // CAN
+        //
+        // 数据后，就会调用：
+        //
         // uart_receive_callback()
-        // 或
         // can_receive_callback()
         //
         //
         // 第二个参数 board_serial：
-        // --------------------------------
-        // 从 ROS2 参数中读取开发板序列号筛选条件。
-        //
-        // 我们当前 YAML 中写的是：
-        //
-        // board_serial: ""
-        //
-        // librmcs 源码已经确认：
-        //
-        // 空字符串表示不按照序列号筛选，
-        // 即接受任意匹配的 CBoard。
-    }
-
-    void update() override {
-        dr16_.update_status();
-
-        // uart_receive_callback() 负责：
-        //
-        // 收到原始 DBUS 数据
-        //        ↓
-        // dr16_.store_status()
-        //
-        // 而这里的 update_status() 负责真正把原始数据解析成：
-        //
-        // 左摇杆
-        // 右摇杆
-        // 拨杆
-        // 鼠标
-        // 键盘
-        //
-        // RMCS Executor 会周期调用本函数。
         //
         // 当前 YAML 中：
         //
-        // update_rate: 1000.0
+        // board_serial: ""
         //
-        // 即目标更新频率为 1000 Hz。
+        // 空字符串表示不按照序列号筛选 CBoard。
     }
 
+
+    // ============================================================
+    // RMCS 周期更新
+    // ============================================================
+    void update() override {
+
+        // --------------------------------------------------------
+        // 1. 更新 DR16 状态
+        // --------------------------------------------------------
+        dr16_.update_status();
+
+        // uart_receive_callback()
+        // 负责保存原始 DBUS 数据。
+        //
+        // update_status()
+        // 再把它解析成：
+        //
+        // joystick_left()
+        // joystick_right()
+        // 拨杆
+        // 键盘
+        // 鼠标
+        //
+        // 后面“摇杆 → 目标速度”会使用这里的数据。
+
+
+        // --------------------------------------------------------
+        // 2. 更新 M3508 状态
+        // --------------------------------------------------------
+        motor_.update_status();
+
+        // can_receive_callback()
+        // 保存的是原始 8 Byte CAN 数据。
+        //
+        // motor_.update_status()
+        // 会把这些数据解析成：
+        //
+        // angle()       rad
+        // velocity()    rad/s
+        // torque()      N·m
+        // temperature() ℃
+
+
+        // --------------------------------------------------------
+        // 3. 还没有收到真实 M3508 反馈时，不打印
+        // --------------------------------------------------------
+        if (!motor_feedback_found_) {
+            return;
+        }
+
+
+        // --------------------------------------------------------
+        // 4. 控制日志打印频率
+        // --------------------------------------------------------
+        ++velocity_log_counter_;
+
+        // 当前 YAML：
+        //
+        // update_rate: 1000.0
+        //
+        // 也就是：
+        //
+        // 每秒大约执行 1000 次 update()
+        //
+        // 如果我们每次都打印：
+        //
+        // 一秒钟会产生大约 1000 行日志，
+        // 终端会完全被刷满。
+        //
+        // 所以累计 1000 次以后才打印一次。
+        if (velocity_log_counter_ >= 1000) {
+
+            velocity_log_counter_ = 0;
+
+            RCLCPP_INFO(
+                get_logger(),
+
+                "M3508 velocity = %.3f rad/s, "
+                "angle = %.3f rad, "
+                "temperature = %.1f C",
+
+                motor_.velocity(),
+                motor_.angle(),
+                motor_.temperature()
+            );
+
+            // ----------------------------------------------------
+            // motor_.velocity()
+            // ----------------------------------------------------
+            //
+            // 实际电机速度。
+            //
+            // 单位：
+            //
+            // rad/s
+            //
+            // 即“弧度每秒”。
+            //
+            // 1 圈 = 2π rad
+            //
+            // 所以：
+            //
+            // 60 RPM
+            // = 每秒 1 圈
+            // ≈ 6.283 rad/s
+            //
+            //
+            // ----------------------------------------------------
+            // motor_.angle()
+            // ----------------------------------------------------
+            //
+            // 当前角度。
+            //
+            // 单位：
+            //
+            // rad
+            //
+            //
+            // ----------------------------------------------------
+            // motor_.temperature()
+            // ----------------------------------------------------
+            //
+            // 电机反馈温度。
+            //
+            // 单位：
+            //
+            // 摄氏度 ℃
+        }
+    }
+
+
+    // ============================================================
+    // DR16 DBUS 接收回调
+    // ============================================================
     void uart_receive_callback(
         const Spec::Uart& uart,
         const View::Uart& data
     ) override {
 
-        // CBoard 一共有：
+        // CBoard 当前具有：
         //
         // DBUS
         // UART1
         // UART2
         //
         // DR16 使用的是 DBUS，
-        // 因此首先判断当前数据是不是来自 DBUS。
-
+        // 所以这里只处理 DBUS 数据。
         if (uart == Spec::kUarts.kDbus) {
 
             dr16_.store_status(
@@ -166,206 +310,211 @@ public:
                 data.uart_data.size()
             );
 
-            // uart_data.data()
-            // --------------------------------
+            // data.uart_data.data()
+            //
             // UART 数据在内存中的起始地址。
             //
-            // uart_data.size()
-            // --------------------------------
-            // 当前这一帧 UART 数据的字节数。
             //
-            // dr16_.store_status()
-            // --------------------------------
-            // 先把 DR16 原始 DBUS 数据保存起来。
+            // data.uart_data.size()
+            //
+            // 当前 UART 数据长度。
+            //
+            //
+            // store_status()
+            //
+            // 先保存原始 DR16 数据。
             //
             // 下一次 update()：
             //
             // dr16_.update_status()
             //
-            // 才会进一步把这些数据解析成摇杆等状态。
+            // 再真正解析。
         }
     }
 
+
+    // ============================================================
+    // M3508 CAN 接收回调
+    // ============================================================
     void can_receive_callback(
         const Spec::Can& can,
         const View::Can& data
     ) override {
 
-        // ============================================================
-        // 临时 CAN 诊断代码
-        // ============================================================
+        // --------------------------------------------------------
+        // 1. 只监听物理 CAN1
+        // --------------------------------------------------------
         //
-        // 这一段现在不是最终的电机控制代码。
+        // 我们已经从 CBoard 源码确认：
         //
-        // 它只负责：
-        //
-        // C620
-        //   ↓ CAN 反馈
-        // CBoard
-        //   ↓
-        // can_receive_callback()
-        //   ↓
-        // 找到 DJI 电机反馈
-        //   ↓
-        // 打印 CAN 通道 + CAN ID
-        //
-        //
-        // 我们现在还不知道朋友设置的 C620 ID，
-        // 所以不能提前把反馈 ID 写死成 0x201。
-        //
-        // DJI 电机反馈常见 ID 范围：
-        //
-        // 0x201 ~ 0x208
-        //
-        // 例如：
-        //
-        // C620 ID 1
+        // 物理 CAN1
         //     ↓
-        // CAN ID 0x201
+        // Spec::kCans.kCan1
         //
-        // C620 ID 3
-        //     ↓
-        // CAN ID 0x203
-
-        if (motor_feedback_found_) {
-            // 已经成功找到过一次反馈以后，
-            // 后续直接返回。
-            //
-            // C620 会持续、高频地发送电机反馈，
-            // 如果每一帧都 RCLCPP_INFO，
-            // 终端会被大量日志刷满。
+        // 同时实物 C620 也确实连接在 CAN1。
+        if (can != Spec::kCans.kCan1) {
             return;
         }
 
+
+        // --------------------------------------------------------
+        // 2. 检查 CAN 帧格式
+        // --------------------------------------------------------
         if (
             data.is_extended_can_id ||
             data.is_remote_transmission ||
-            data.can_data.size() < 8
+            data.can_data.size() != 8
         ) {
-            // DJI 电机正常反馈使用标准 CAN 数据帧，
-            // 并且反馈数据长度为 8 Byte。
+
+            // M3508 + C620 正常反馈使用：
             //
-            // 如果：
-            // - 是扩展 CAN ID
-            // - 是 Remote Frame
-            // - 数据不足 8 Byte
+            // 标准 CAN ID
+            // 非 Remote Frame
+            // 8 Byte 数据
             //
-            // 就不是我们当前想找的正常 DJI 电机反馈，
-            // 直接忽略。
+            // 不符合就不处理。
             return;
         }
 
-        if (data.can_id < 0x201 || data.can_id > 0x208) {
-            // 现在只关心 DJI 电机反馈 ID。
-            //
-            // 其他 CAN 设备可能也会往总线上发数据，
-            // 这里先全部过滤掉，
-            // 避免影响我们判断 C620 ID。
-            return;
+
+        // --------------------------------------------------------
+        // 3. 交给 DjiMotor 判断 CAN ID
+        // --------------------------------------------------------
+        const bool matched =
+            motor_.match_then_store_status(
+                data.can_id,
+                data.can_data
+            );
+
+        // 当前 motor_：
+        //
+        // Type = M3508
+        // ID   = 3
+        //
+        // DjiMotor 内部计算：
+        //
+        // recv_id()
+        // = 0x200 + 3
+        // = 0x203
+        //
+        //
+        // 如果收到：
+        //
+        // CAN ID = 0x203
+        //
+        // matched = true
+        //
+        // 数据会被保存。
+        //
+        //
+        // 如果收到：
+        //
+        // 0x201
+        // 0x202
+        // 或者其他设备
+        //
+        // matched = false
+        //
+        // 不会污染当前 motor_ 的状态。
+
+
+        // --------------------------------------------------------
+        // 4. 第一次收到正确反馈时打印一次
+        // --------------------------------------------------------
+        if (matched && !motor_feedback_found_) {
+
+            RCLCPP_INFO(
+                get_logger(),
+                "M3508 feedback connected: CAN1, ID = 0x%03X",
+                static_cast<unsigned int>(data.can_id)
+            );
+
+            motor_feedback_found_ = true;
         }
 
-        const char* can_name = "Unknown";
-
-        // CBoard 源码已经确认：
+        // C620 会持续发送大量反馈。
         //
-        // 物理 CAN1 → Spec::kCans.kCan1
-        // 物理 CAN2 → Spec::kCans.kCan2
-        //
-        // 你朋友现在把 C620 接在物理 CAN1，
-        // 因此正常情况下后面应该检测到 kCan1。
-
-        if (can == Spec::kCans.kCan1) {
-            can_name = "kCan1";
-        } else if (can == Spec::kCans.kCan2) {
-            can_name = "kCan2";
-        }
-
-        RCLCPP_INFO(
-            get_logger(),
-            "DJI motor feedback detected: %s, CAN ID = 0x%03X",
-            can_name,
-            static_cast<unsigned int>(data.can_id)
-        );
-
-        // 如果以后输出例如：
-        //
-        // DJI motor feedback detected:
-        // kCan1, CAN ID = 0x203
-        //
-        // 那么我们就能同时知道：
-        //
-        // 物理连接：
-        // CAN1 → kCan1
-        //
-        // C620 ID：
-        // 0x203 → ID 3
-
-        motor_feedback_found_ = true;
-
-        // 标记：
-        // “我们已经成功发现过一次 DJI 电机反馈。”
-        //
-        // 后续 CAN 帧就不再重复打印。
+        // 因此这个“连接成功”日志只打印一次。
     }
 
+
 private:
+
+    // ============================================================
+    // M3508 是否已经连接成功
+    // ============================================================
     bool motor_feedback_found_ = false;
 
-    // 临时 CAN 诊断标志。
-    //
     // false：
-    // --------------------------------
-    // 还没有检测到 DJI 电机反馈。
+    //
+    // 还没有收到 M3508 ID 3 的 0x203。
     //
     // true：
-    // --------------------------------
-    // 已经检测并打印过一次反馈，
-    // 后续不再重复打印。
     //
-    // 等我们真正确认 C620 ID 后，
-    // 这一套临时诊断代码会被删除，
-    // 换成真正的：
-    //
-    // motor_.store_status(...)
-    //
-    // 数据链。
+    // 已经至少收到过一次正确反馈。
 
 
+    // ============================================================
+    // 转速日志计数器
+    // ============================================================
+    std::uint32_t velocity_log_counter_ = 0;
+
+    // 当前 RMCS：
+    //
+    // update_rate = 1000 Hz
+    //
+    // 因此：
+    //
+    // velocity_log_counter_ += 1
+    //
+    // 累计到 1000：
+    //
+    // 大约经过 1 秒。
+    //
+    // 这样我们只会每秒打印一次电机反馈。
+
+
+    // ============================================================
+    // CBoard
+    // ============================================================
     std::unique_ptr<librmcs::board::CBoard> board_;
 
-    // CBoard 通信对象。
-    //
-    // 实际链路：
+    // 数据链：
     //
     // 电脑
-    //  ↓ USB
+    //   ↓ USB
     // CBoard
-    //  ↓
-    // CAN / UART / DBUS
-    //  ↓
+    //   ↓
+    // DBUS / CAN
+    //   ↓
     // 当前 Dr16MotorControl
     //
     //
-    // 如果没有 board_：
+    // 为什么用 unique_ptr？
     //
-    // 虽然我们继承了 CBoard::Callback，
-    // 但是实际上没有任何 CBoard 对象和电脑通信，
-    // 回调函数也不会收到真实硬件数据。
+    // 因为 CBoard 构造以后可能立刻开始接收硬件数据。
+    //
+    // 我们希望：
+    //
+    // 其他成员先初始化
+    //       ↓
+    // 再创建 CBoard
+    //
+    // 这样更加安全。
 
 
+    // ============================================================
+    // DR16
+    // ============================================================
     device::Dr16 dr16_;
 
-    // DR16 遥控器状态对象。
-    //
-    // 完整的数据链是：
+    // 数据链：
     //
     // DR16 遥控器
     //      ↓ 无线
     // DR16 接收机
     //      ↓ DBUS
     // CBoard
-    //      ↓ USB
-    // librmcs
     //      ↓
     // uart_receive_callback()
     //      ↓
@@ -374,32 +523,67 @@ private:
     // update()
     //      ↓
     // dr16_.update_status()
-    //      ↓
-    // joystick_left()
-    // joystick_right()
     //
-    // 后面我们会从这里读取摇杆值，
-    // 再映射成 M3508 的目标速度。
+    // 后面会读取：
+    //
+    // dr16_.joystick_left()
+    //
+    // 来产生 M3508 目标速度。
+
+
+    // ============================================================
+    // M3508
+    // ============================================================
+    device::DjiMotor motor_{
+        *this,
+        *this,
+        "/motor"
+    };
+
+    // DjiMotor 第一个 Component：
+    //
+    // *this
+    //
+    // 用来注册电机状态输出：
+    //
+    // /motor/angle
+    // /motor/velocity
+    // /motor/torque
+    // /motor/max_torque
+    //
+    //
+    // 第二个 Component：
+    //
+    // *this
+    //
+    // 用来注册：
+    //
+    // /motor/control_torque
+    //
+    //
+    // 但是当前版本没有调用：
+    //
+    // board_->start_transmit()
+    // can_transmit()
+    // motor_.generate_command()
+    //
+    // 因此现在仍然只接收反馈，
+    // 不会主动控制 M3508。
 };
 
 } // namespace rmcs_core::hardware
 
 
+// ============================================================
+// pluginlib 导出
+// ============================================================
+
 #include <pluginlib/class_list_macros.hpp>
-// pluginlib 的组件导出宏。
-// 前面的里程碑已经验证过这一部分可以正常工作。
 
 PLUGINLIB_EXPORT_CLASS(
     rmcs_core::hardware::Dr16MotorControl,
     rmcs_executor::Component
 )
 
-// 把 Dr16MotorControl 导出成 RMCS Component 插件。
-//
-// plugins.xml 中也已经注册：
-//
-// rmcs_core::hardware::Dr16MotorControl
-//
-// 如果缺少这里的 EXPORT：
-// 即使代码已经成功编译进 librmcs_core.so，
-// RMCS Executor 也无法通过 pluginlib 创建这个类。
+// 使 RMCS Executor 可以通过 pluginlib
+// 动态创建 Dr16MotorControl。
