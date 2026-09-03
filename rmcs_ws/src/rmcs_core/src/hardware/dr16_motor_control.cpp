@@ -4,6 +4,8 @@
 #include <rclcpp/node.hpp>
 #include <rmcs_executor/component.hpp>
 
+#include "filter/low_pass_filter.hpp"
+
 #include "hardware/device/dji_motor.hpp"
 #include "hardware/device/dr16.hpp"
 
@@ -13,60 +15,43 @@
 namespace rmcs_core::hardware {
 
 // ============================================================
-// 第二周任务二：DR16 + M3508 电机控制 Hardware
+// 第二周任务二：DR16 + M3508 速度控制 Hardware
 // ============================================================
 //
-// 当前已经完成：
-//
-// ① DR16 数据链
-//
-// DR16 遥控器
-//      ↓ 无线
-// DR16 接收机
-//      ↓ DBUS
-// CBoard
-//      ↓
-// uart_receive_callback()
-//      ↓
-// dr16_.store_status()
-//      ↓
-// dr16_.update_status()
-//
-//
-// ② M3508 反馈链
-//
-// M3508
-//      ↓
-// C620，ID = 3
-//      ↓ CAN1 / 0x203
-// CBoard
-//      ↓
-// can_receive_callback()
-//      ↓
-// DjiMotor
-//      ↓
-// angle / velocity / torque / temperature
-//
-//
-// ③ 当前新增
+// 当前数据链：
 //
 // DR16 左摇杆 Y
 //      ↓
-// [-1, +1]
+// target_velocity_
+//
+//
+// M3508
+//      ↓ CAN1 / 0x203
+// motor_.velocity()
 //      ↓
-// × max_target_velocity
+// raw_velocity_
 //      ↓
-// target_velocity
-//
-//
-// 目前仍然没有：
-//
 // LowPassFilter
-// PID
-// CAN 控制发送
+//      ↓
+// filtered_velocity_
 //
-// 所以：
-// 当前程序依旧不会主动控制 M3508 转动。
+//
+// 下一阶段才会继续：
+//
+// target_velocity_ - filtered_velocity_
+//      ↓
+// error
+//      ↓
+// PID
+//      ↓
+// control_torque
+//      ↓
+// CAN
+//      ↓
+// M3508
+//
+//
+// 当前版本仍然不会主动发送电机控制命令。
 class Dr16MotorControl
     : public rmcs_executor::Component
     , public rclcpp::Node
@@ -76,54 +61,79 @@ public:
     Dr16MotorControl()
         : Node{
               get_component_name(),
-
               rclcpp::NodeOptions{}
                   .automatically_declare_parameters_from_overrides(true)
           } {
 
         // ========================================================
-        // 读取最大目标速度
+        // 1. 读取 DR16 最大目标速度
         // ========================================================
-        //
-        // YAML 中我们会写：
-        //
-        // max_target_velocity: 10.0
-        //
-        // 单位：
-        //
-        // rad/s
-        //
-        // 以后摇杆推满时：
-        //
-        // +1 × 10
-        // = +10 rad/s
-        //
-        // 摇杆拉到底：
-        //
-        // -1 × 10
-        // = -10 rad/s
         max_target_velocity_ =
             get_parameter("max_target_velocity").as_double();
 
-
-        // ========================================================
-        // 配置 M3508
-        // ========================================================
+        // 当前 YAML：
         //
-        // 我们已经通过真实硬件测试确认：
-        //
-        // M3508 feedback connected:
-        // CAN1, ID = 0x203
-        //
-        // 对 M3508：
-        //
-        // recv_id = 0x200 + 电调 ID
+        // max_target_velocity: 10.0
         //
         // 所以：
         //
-        // 0x203
-        //   ↓
-        // ID = 3
+        // 左摇杆 +1 → +10 rad/s
+        // 左摇杆  0 →   0 rad/s
+        // 左摇杆 -1 → -10 rad/s
+
+
+        // ========================================================
+        // 2. 读取低通滤波器截止频率
+        // ========================================================
+        velocity_filter_cutoff_hz_ =
+            get_parameter("velocity_filter_cutoff_hz").as_double();
+
+        // 截止频率：
+        //
+        // 可以先简单理解成：
+        //
+        // “变化多快的数据允许比较完整地通过”
+        //
+        // 截止频率越低：
+        // → 越平滑
+        // → 但是反应越慢
+        //
+        // 截止频率越高：
+        // → 反应越快
+        // → 但是滤波效果越弱
+
+
+        // ========================================================
+        // 3. 配置低通滤波器
+        // ========================================================
+        velocity_filter_.set_cutoff(
+            velocity_filter_cutoff_hz_,
+            kUpdateFrequencyHz
+        );
+
+        // LowPassFilter 源码中的参数顺序：
+        //
+        // set_cutoff(
+        //     cutoff_frequency,
+        //     sampling_frequency
+        // )
+        //
+        // 我们现在：
+        //
+        // cutoff   = 10 Hz
+        // sampling = 1000 Hz
+        //
+        // sampling = 1000 Hz 的原因：
+        //
+        // rmcs_executor:
+        //   update_rate: 1000.0
+        //
+        // 即 update() 大约每 1 ms 执行一次。
+
+
+        // ========================================================
+        // 4. 配置 M3508
+        // ========================================================
         motor_.configure(
             device::DjiMotor::Config{
                 device::DjiMotor::Type::kM3508,
@@ -131,89 +141,42 @@ public:
             }
         );
 
+        // 实机已经确认：
+        //
+        // M3508
+        // C620 ID = 3
+        //
+        // 反馈：
+        //
+        // CAN1
+        // CAN ID = 0x203
+
 
         // ========================================================
-        // 创建 CBoard
+        // 5. 创建 CBoard
         // ========================================================
         board_ = std::make_unique<librmcs::board::CBoard>(
             *this,
             get_parameter("board_serial").as_string()
         );
-
-        // *this：
-        //
-        // 当前 Dr16MotorControl 本身就是
-        // CBoard::Callback。
-        //
-        // 因此 CBoard 收到：
-        //
-        // DBUS
-        // CAN
-        //
-        // 数据以后，会调用当前类的：
-        //
-        // uart_receive_callback()
-        // can_receive_callback()
-        //
-        //
-        // board_serial：
-        //
-        // 当前我们设置为空字符串：
-        //
-        // ""
-        //
-        // 意味着不按序列号筛选 CBoard。
     }
 
 
     // ============================================================
-    // RMCS 周期更新函数
+    // RMCS 周期更新
     // ============================================================
     void update() override {
 
         // ========================================================
-        // 1. 更新 DR16
+        // 一、更新 DR16
         // ========================================================
         dr16_.update_status();
 
-        // uart_receive_callback()
-        // 只是负责保存原始 DBUS 数据。
-        //
-        // update_status()
-        // 才真正解析：
-        //
-        // 左摇杆
-        // 右摇杆
-        // 拨杆
-        // 鼠标
-        // 键盘
-        // 等状态。
-
 
         // ========================================================
-        // 2. DR16 左摇杆 Y → 目标速度
+        // 二、DR16 左摇杆 → 目标速度
         // ========================================================
         if (dr16_.valid()) {
-
-            // dr16_.valid() == true
-            //
-            // 表示：
-            //
-            // 当前遥控器数据有效。
-            //
-            //
-            // joystick_left().y()
-            //
-            // 大致范围：
-            //
-            // -1.0 ～ +1.0
-            //
-            //
-            // 所以：
-            //
-            // target_velocity
-            // =
-            // joystick_y × max_target_velocity
 
             target_velocity_ =
                 dr16_.joystick_left().y()
@@ -221,63 +184,93 @@ public:
 
         } else {
 
-            // ====================================================
-            // 遥控器掉线保护
-            // ====================================================
+            // 遥控器掉线：
             //
-            // 如果 DR16 掉线，
-            // 目标速度必须立即清零。
-            //
-            // 这是非常重要的安全逻辑。
-            //
-            // 假设之前：
-            //
-            // target_velocity = 10 rad/s
-            //
-            // 然后遥控器突然断开。
-            //
-            // 如果我们不清零：
-            //
-            // PID 以后仍然可能继续认为目标速度是 10，
-            // 电机就可能继续转。
-            //
-            // 所以掉线以后：
-            //
-            // target_velocity = 0
+            // 目标速度立即清零。
             target_velocity_ = 0.0;
         }
 
 
         // ========================================================
-        // 3. 更新 M3508
+        // 三、更新 M3508 状态
         // ========================================================
         motor_.update_status();
 
         // can_receive_callback()
-        // 保存的是原始 CAN 数据。
+        // 会保存原始 CAN 数据。
         //
         // update_status()
-        // 负责解析：
+        // 再把 CAN 数据解析成：
         //
-        // angle()       rad
-        // velocity()    rad/s
-        // torque()      N·m
-        // temperature() °C
+        // angle()
+        // velocity()
+        // torque()
+        // temperature()
 
 
         // ========================================================
-        // 4. 每秒打印一次状态
+        // 四、M3508 原始速度 → LowPassFilter
+        // ========================================================
+        if (motor_feedback_found_) {
+
+            // --------------------------------------------
+            // 1. 取得原始电机速度
+            // --------------------------------------------
+            raw_velocity_ =
+                motor_.velocity();
+
+            // 单位：
+            //
+            // rad/s
+
+
+            // --------------------------------------------
+            // 2. 送进一阶低通滤波器
+            // --------------------------------------------
+            filtered_velocity_ =
+                velocity_filter_.update(
+                    raw_velocity_
+                );
+
+            // LowPassFilter 内部核心公式：
+            //
+            // output
+            // =
+            // alpha × input
+            // +
+            // (1 - alpha) × previous_output
+            //
+            //
+            // 可以理解成：
+            //
+            // 新结果
+            // =
+            // 一部分“最新数据”
+            // +
+            // 一部分“上一时刻数据”
+            //
+            // 所以速度不会因为单个瞬时抖动
+            // 立刻发生很大的跳变。
+
+        } else {
+
+            // 还没有真实电机反馈。
+            //
+            // 这时候不能把 motor_.velocity()
+            // 当成有效测量值。
+            raw_velocity_ = 0.0;
+            filtered_velocity_ = 0.0;
+
+            // 清掉滤波器的历史状态。
+            velocity_filter_.reset();
+        }
+
+
+        // ========================================================
+        // 五、每秒打印一次状态
         // ========================================================
         ++status_log_counter_;
 
-        // 当前：
-        //
-        // update_rate = 1000 Hz
-        //
-        // 所以大约：
-        //
-        // 1000 次 update()
-        // ≈ 1 秒
         if (status_log_counter_ >= 1000) {
 
             status_log_counter_ = 0;
@@ -285,92 +278,87 @@ public:
             RCLCPP_INFO(
                 get_logger(),
 
-                "DR16 valid = %s, "
-                "joystick Y = %.3f, "
-                "target = %.3f rad/s, "
-                "motor = %s, "
-                "actual = %.3f rad/s",
+                "DR16=%s, "
+                "joystick=%.3f, "
+                "target=%.3f rad/s, "
+                "raw=%.3f rad/s, "
+                "filtered=%.3f rad/s",
 
-                dr16_.valid() ? "true" : "false",
+                dr16_.valid()
+                    ? "valid"
+                    : "invalid",
 
                 dr16_.joystick_left().y(),
 
                 target_velocity_,
 
-                motor_feedback_found_
-                    ? "connected"
-                    : "disconnected",
+                raw_velocity_,
 
-                motor_.velocity()
+                filtered_velocity_
             );
 
-            // 比如以后可能看到：
+            // 后面会看到类似：
             //
-            // DR16 valid = true,
-            // joystick Y = 0.500,
-            // target = 5.000 rad/s,
-            // motor = disconnected,
-            // actual = 0.000 rad/s
+            // DR16=valid,
+            // joystick=0.500,
+            // target=5.000 rad/s,
+            // raw=4.800 rad/s,
+            // filtered=4.600 rad/s
             //
             //
-            // 这意味着：
+            // target：
+            // 想让电机达到多少速度
             //
-            // 遥控器正常
-            // 左摇杆推到一半
-            // 目标速度 5 rad/s
+            // raw：
+            // M3508 当前原始回传速度
             //
-            // 但因为现在还没写 PID + CAN 控制，
-            // 所以电机实际速度仍然是 0。
+            // filtered：
+            // 原始速度经过低通滤波之后的速度
         }
     }
 
 
     // ============================================================
-    // DR16 DBUS 接收
+    // DR16 / DBUS 接收回调
     // ============================================================
     void uart_receive_callback(
         const Spec::Uart& uart,
         const View::Uart& data
     ) override {
 
-        // CBoard 具有：
-        //
-        // DBUS
-        // UART1
-        // UART2
-        //
-        // DR16 使用的是 DBUS。
-        if (uart == Spec::kUarts.kDbus) {
+        // DR16 使用 CBoard 的 DBUS。
+        if (uart != Spec::kUarts.kDbus) {
+            return;
+        }
 
-            dr16_.store_status(
-                data.uart_data.data(),
+
+        // ========================================================
+        // 第一次收到 DBUS 时打印一次
+        // ========================================================
+        if (!dbus_packet_found_) {
+
+            RCLCPP_INFO(
+                get_logger(),
+                "DBUS packet received, size = %zu bytes",
                 data.uart_data.size()
             );
 
-            // data()
-            //
-            // 当前 DBUS 数据的内存起始地址。
-            //
-            // size()
-            //
-            // 当前 DBUS 数据长度。
-            //
-            //
-            // store_status()
-            //
-            // 把原始数据保存起来。
-            //
-            // 下一次 update()：
-            //
-            // dr16_.update_status()
-            //
-            // 再真正解析。
+            dbus_packet_found_ = true;
         }
+
+
+        // ========================================================
+        // 保存 DR16 原始数据
+        // ========================================================
+        dr16_.store_status(
+            data.uart_data.data(),
+            data.uart_data.size()
+        );
     }
 
 
     // ============================================================
-    // M3508 CAN 接收
+    // M3508 CAN 接收回调
     // ============================================================
     void can_receive_callback(
         const Spec::Can& can,
@@ -378,47 +366,27 @@ public:
     ) override {
 
         // ========================================================
-        // 1. 只处理 CAN1
+        // 1. 只接收 CAN1
         // ========================================================
-        //
-        // 实物接线已经确认：
-        //
-        // C620
-        //   ↓
-        // CBoard CAN1
-        //
-        // CBoard 源码也已经确认：
-        //
-        // 物理 CAN1
-        // =
-        // Spec::kCans.kCan1
         if (can != Spec::kCans.kCan1) {
             return;
         }
 
 
         // ========================================================
-        // 2. 检查 CAN 数据格式
+        // 2. 检查 CAN 帧
         // ========================================================
         if (
             data.is_extended_can_id ||
             data.is_remote_transmission ||
             data.can_data.size() != 8
         ) {
-
-            // DJI M3508 正常反馈是：
-            //
-            // 标准 CAN 帧
-            // 非 Remote Frame
-            // 8 Byte
-            //
-            // 不符合则直接忽略。
             return;
         }
 
 
         // ========================================================
-        // 3. 交给 DjiMotor 判断是不是自己的反馈
+        // 3. 判断是不是当前 M3508
         // ========================================================
         const bool matched =
             motor_.match_then_store_status(
@@ -426,46 +394,35 @@ public:
                 data.can_data
             );
 
-        // 当前 motor_：
+        // 当前：
         //
-        // Type = M3508
-        // ID   = 3
+        // M3508 ID = 3
         //
-        // 所以：
+        // 所以反馈 CAN ID：
         //
-        // recv_id()
-        // =
         // 0x200 + 3
         // =
         // 0x203
-        //
-        //
-        // 收到 0x203：
-        //
-        // matched = true
-        //
-        // 数据被保存。
-        //
-        //
-        // 收到其他 CAN ID：
-        //
-        // matched = false
-        //
-        // 不处理。
 
 
         // ========================================================
-        // 4. 第一次连接成功时打印
+        // 4. 第一次收到正确反馈时提示
         // ========================================================
         if (matched && !motor_feedback_found_) {
 
             RCLCPP_INFO(
                 get_logger(),
                 "M3508 feedback connected: CAN1, ID = 0x%03X",
-                static_cast<unsigned int>(data.can_id)
+                static_cast<unsigned int>(
+                    data.can_id
+                )
             );
 
             motor_feedback_found_ = true;
+
+            // 新连接电机反馈时，
+            // 清空之前滤波器的历史数据。
+            velocity_filter_.reset();
         }
     }
 
@@ -473,17 +430,29 @@ public:
 private:
 
     // ============================================================
-    // 最大目标速度
+    // 当前 RMCS 更新频率
+    // ============================================================
+    static constexpr double
+        kUpdateFrequencyHz = 1000.0;
+
+    // 当前 YAML：
+    //
+    // update_rate: 1000.0
+    //
+    // 所以这里保持一致。
+    //
+    // 如果以后改 RMCS update_rate，
+    // 这里的采样频率也必须一起修改。
+
+
+    // ============================================================
+    // DR16 最大目标速度
     // ============================================================
     double max_target_velocity_ = 0.0;
 
     // 单位：
     //
     // rad/s
-    //
-    // 来自 YAML：
-    //
-    // max_target_velocity: 10.0
 
 
     // ============================================================
@@ -491,15 +460,35 @@ private:
     // ============================================================
     double target_velocity_ = 0.0;
 
-    // 数据链：
+    // 来源：
     //
-    // 左摇杆 Y
-    //      ↓
-    // [-1, +1]
-    //      ↓
-    // × max_target_velocity
-    //      ↓
-    // target_velocity_
+    // DR16 左摇杆 Y
+    // ×
+    // max_target_velocity_
+
+
+    // ============================================================
+    // 低通滤波器截止频率
+    // ============================================================
+    double velocity_filter_cutoff_hz_ = 0.0;
+
+    // 单位：
+    //
+    // Hz
+    //
+    // 当前先使用：
+    //
+    // 10 Hz
+
+
+    // ============================================================
+    // 原始 M3508 速度
+    // ============================================================
+    double raw_velocity_ = 0.0;
+
+    // 来源：
+    //
+    // motor_.velocity()
     //
     // 单位：
     //
@@ -507,59 +496,67 @@ private:
 
 
     // ============================================================
-    // 是否收到过 M3508 反馈
+    // 滤波后的 M3508 速度
+    // ============================================================
+    double filtered_velocity_ = 0.0;
+
+    // 后面 PID 不直接使用：
+    //
+    // motor_.velocity()
+    //
+    // 而是使用：
+    //
+    // filtered_velocity_
+
+
+    // ============================================================
+    // 一阶低通滤波器
+    // ============================================================
+    filter::LowPassFilter<1>
+        velocity_filter_{1.0};
+
+    // <1>
+    //
+    // 表示：
+    //
+    // 这个滤波器处理一个 double。
+    //
+    // 我们处理的是：
+    //
+    // M3508 velocity
+    //
+    // 所以使用 LowPassFilter<1>。
+
+
+    // ============================================================
+    // 是否收到 DBUS
+    // ============================================================
+    bool dbus_packet_found_ = false;
+
+
+    // ============================================================
+    // 是否收到 M3508 反馈
     // ============================================================
     bool motor_feedback_found_ = false;
 
-    // false：
-    //
-    // 还没有收到 0x203。
-    //
-    // true：
-    //
-    // 已经收到过真实 M3508 反馈。
-
 
     // ============================================================
-    // 状态日志计数器
+    // 日志计数器
     // ============================================================
     std::uint32_t status_log_counter_ = 0;
 
-    // RMCS 1000 Hz：
-    //
-    // 每执行一次 update()
-    // 就 +1。
-    //
-    // 到 1000 后打印一次，
-    // 相当于大约每秒打印一次。
-
 
     // ============================================================
     // CBoard
     // ============================================================
-    std::unique_ptr<librmcs::board::CBoard> board_;
-
-    // 电脑
-    //   ↓ USB
-    // CBoard
-    //   ↓
-    // DBUS / CAN
-    //   ↓
-    // Dr16MotorControl
+    std::unique_ptr<librmcs::board::CBoard>
+        board_;
 
 
     // ============================================================
     // DR16
     // ============================================================
     device::Dr16 dr16_;
-
-    // 遥控器
-    //   ↓
-    // DR16 接收机
-    //   ↓ DBUS
-    // CBoard
-    //   ↓
-    // dr16_
 
 
     // ============================================================
@@ -571,38 +568,20 @@ private:
         "/motor"
     };
 
-    // 第一个 *this：
+    // 当前依然只是：
     //
-    // 注册电机状态输出：
+    // 接收 M3508 反馈。
     //
-    // /motor/angle
-    // /motor/velocity
-    // /motor/torque
-    // /motor/max_torque
+    // 还没有调用：
     //
-    //
-    // 第二个 *this：
-    //
-    // 注册：
-    //
-    // /motor/control_torque
-    //
-    //
-    // 但当前版本仍然没有：
-    //
-    // board_->start_transmit()
+    // generate_command()
     // can_transmit()
-    // motor_.generate_command()
     //
-    // 所以现在不会主动控制电机。
+    // 所以不会主动驱动电机。
 };
 
 } // namespace rmcs_core::hardware
 
-
-// ============================================================
-// pluginlib 导出
-// ============================================================
 
 #include <pluginlib/class_list_macros.hpp>
 

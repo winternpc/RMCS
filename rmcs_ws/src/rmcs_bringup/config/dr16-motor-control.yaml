@@ -8,4 +8,4 @@ dr16_motor_control:
   ros__parameters:
     board_serial: ""
     max_target_velocity: 10.0
-    
+    velocity_filter_cutoff_hz: 10.0
