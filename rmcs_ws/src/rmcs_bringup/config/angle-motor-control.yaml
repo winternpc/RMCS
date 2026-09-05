@@ -1,0 +1,78 @@
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+
+    components:
+      # 电机硬件：输出 angle / velocity，并创建 command Partner
+      - rmcs_core::hardware::AngleMotorHardware -> angle_motor_hardware
+
+      # ROS2 目标角度 -> 优弧角度误差
+      - rmcs_core::controller::AngleTargetController -> angle_target_controller
+
+      # 外环：角度误差 -> 目标速度
+      - rmcs_core::controller::pid::ErrorPidController -> angle_pid_controller
+
+      # 内环：目标速度 - 实际速度 -> 控制力矩
+      - rmcs_core::controller::pid::PidController -> velocity_pid_controller
+
+
+angle_motor_hardware:
+  ros__parameters:
+    board_serial: ""
+
+
+angle_target_controller:
+  ros__parameters: {}
+
+
+# -----------------------------
+# 角度外环
+# -----------------------------
+angle_pid_controller:
+  ros__parameters:
+
+    # AngleTargetController 已经算好了误差
+    measurement: /motor/control_angle_error
+
+    # 外环输出作为速度内环的目标速度
+    control: /motor/control_velocity
+
+    # 第一版先只用 P，方便调试
+    kp: 2.0
+    ki: 0.0
+    kd: 0.0
+
+    # 限制外环最大目标速度
+    output_min: -3.0
+    output_max: 3.0
+
+
+# -----------------------------
+# 速度内环
+# -----------------------------
+velocity_pid_controller:
+  ros__parameters:
+
+    # 实际电机速度
+    measurement: /motor/velocity
+
+    # 角度外环给出的目标速度
+    setpoint: /motor/control_velocity
+
+    # 最终交给 AngleMotorCommand
+    control: /motor/control_torque
+
+    # 先沿用任务二已经能工作的速度环参数
+    kp: 0.05
+    ki: 0.0005
+    kd: 0.0
+
+    integral_min: -100.0
+    integral_max: 100.0
+
+    integral_split_min: -1.0
+    integral_split_max: 1.0
+
+    # 先限制力矩，第一次实机更安全
+    output_min: -0.2
+    output_max: 0.2
