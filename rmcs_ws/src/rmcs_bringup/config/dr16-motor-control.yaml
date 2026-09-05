@@ -3,6 +3,7 @@ rmcs_executor:
     update_rate: 1000.0
     components:
       - rmcs_core::hardware::Dr16MotorControl -> dr16_motor_control
+      - rmcs_core::controller::pid::PidController -> velocity_pid_controller
 
 dr16_motor_control:
   ros__parameters:
@@ -12,15 +13,22 @@ dr16_motor_control:
 
     velocity_filter_cutoff_hz: 10.0
 
-    velocity_kp: 0.05
-    velocity_ki: 0.0005
-    velocity_kd: 0.0
+velocity_pid_controller:
+  ros__parameters:
+    # 参考 pid_controller.cpp 的速度闭环连接方式
+    measurement: /motor/velocity_filtered
+    setpoint: /motor/target_velocity
+    control: /motor/control_torque
 
-    velocity_integral_min: -100.0
-    velocity_integral_max: 100.0
+    kp: 0.05
+    ki: 0.0005
+    kd: 0.0
 
-    velocity_integral_split_min: -1.0
-    velocity_integral_split_max: 1.0
-    # 第一次真实驱动先限制得小一点。
-    velocity_output_min: -0.2
-    velocity_output_max: 0.2
+    integral_min: -100.0
+    integral_max: 100.0
+
+    integral_split_min: -1.0
+    integral_split_max: 1.0
+
+    output_min: -0.2
+    output_max: 0.2
