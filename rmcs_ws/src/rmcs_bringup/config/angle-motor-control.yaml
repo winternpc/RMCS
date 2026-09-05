@@ -15,6 +15,9 @@ rmcs_executor:
       # 内环：目标速度 - 实际速度 -> 控制力矩
       - rmcs_core::controller::pid::PidController -> velocity_pid_controller
 
+      # 把双环内部数据发布为 ROS2 Topic，方便调试
+      - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
+
 
 angle_motor_hardware:
   ros__parameters:
@@ -38,7 +41,7 @@ angle_pid_controller:
     control: /motor/control_velocity
 
     # 第一版先只用 P，方便调试
-    kp: 2.0
+    kp: 5.0
     ki: 0.0
     kd: 0.0
 
@@ -62,8 +65,8 @@ velocity_pid_controller:
     # 最终交给 AngleMotorCommand
     control: /motor/control_torque
 
-    # 先沿用任务二已经能工作的速度环参数
-    kp: 0.05
+    # 减速箱实机调试后的速度环参数
+    kp: 1.0
     ki: 0.0005
     kd: 0.0
 
@@ -76,3 +79,18 @@ velocity_pid_controller:
     # 先限制力矩，第一次实机更安全
     output_min: -0.2
     output_max: 0.2
+
+value_broadcaster:
+  ros__parameters:
+    forward_list:
+      # 角度外环输入
+      - /motor/control_angle_error
+
+      # 角度外环输出，也是速度内环目标值
+      - /motor/control_velocity
+
+      # 电机真实速度
+      - /motor/velocity
+
+      # 速度内环最终输出
+      - /motor/control_torque
