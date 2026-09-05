@@ -17,7 +17,7 @@ class AngleMotorHardware
     , public librmcs::board::CBoard::Callback {
 
 private:
-    // 参考 omni_infantry.cpp 中 InfantryCommand 的写法
+    // 参考 omni_infantry.cpp：用 Partner Component 单独负责发送电机命令
     class AngleMotorCommand : public rmcs_executor::Component {
     public:
         explicit AngleMotorCommand(AngleMotorHardware& hardware)
@@ -34,7 +34,6 @@ private:
 
 public:
     AngleMotorHardware()
-        // 参考 omni_infantry.cpp 中 hardware Component 的 Node 初始化方式
         : Node{
               get_component_name(),
               rclcpp::NodeOptions{}
@@ -49,14 +48,15 @@ public:
               )
           )
 
-        // 参考 omni_infantry.cpp 中 DjiMotor 的 status / command 分离写法
+        // 当前 Component 输出电机状态，Partner Component 接收控制力矩
         , motor_{
               *this,
               *motor_command_,
               "/motor"
           } {
 
-        // 参考 dji_motor.hpp 和 omni_infantry.cpp 的电机配置方式
+        // M3508 + C620，ID = 3
+        // 开启多圈角度，后面用于位置闭环
         motor_.configure(
             device::DjiMotor::Config{
                 device::DjiMotor::Type::kM3508,
@@ -66,7 +66,7 @@ public:
         );
 
 
-        // CBoard 的连接方式沿用任务二
+        // CBoard 连接方式沿用任务二
         board_ =
             std::make_unique<librmcs::board::CBoard>(
                 *this,
@@ -75,22 +75,43 @@ public:
     }
 
 
+    // ============================================================
+    // RMCS 主循环：更新电机反馈状态
+    // ============================================================
     void update() override {
 
-        // 参考 dji_motor.hpp：更新后会自动输出 /motor/angle 和 /motor/velocity
+        // 参考任务二：统计距离最后一帧反馈过去了多少个控制周期
+        if (
+            motor_feedback_found_
+            && motor_feedback_age_cycles_ <= kMotorFeedbackTimeoutCycles
+        ) {
+            ++motor_feedback_age_cycles_;
+        }
+
+
+        // DjiMotor 会自动更新：
+        // /motor/angle
+        // /motor/velocity
+        // /motor/torque
         motor_.update_status();
 
 
-        // 当前阶段留一个简单日志，方便确认角度和速度反馈
+        const bool motor_feedback_alive =
+            motor_feedback_found_
+            && motor_feedback_age_cycles_ <= kMotorFeedbackTimeoutCycles;
+
+
+        // 每约 1 秒打印一次状态
         ++log_counter_;
 
         if (log_counter_ >= 1000) {
+
             log_counter_ = 0;
 
             RCLCPP_INFO(
                 get_logger(),
                 "feedback=%s, angle=%.3f rad, velocity=%.3f rad/s",
-                motor_feedback_found_ ? "yes" : "no",
+                motor_feedback_alive ? "alive" : "lost",
                 motor_.angle(),
                 motor_.velocity()
             );
@@ -98,25 +119,30 @@ public:
     }
 
 
-    // 参考任务二 dr16_motor_control.cpp 中的 CAN 接收方式
+    // ============================================================
+    // M3508 CAN 反馈接收
+    // ============================================================
     void can_receive_callback(
         const Spec::Can& can,
         const View::Can& data
     ) override {
 
+        // 当前电机接在 CBoard CAN1
         if (can != Spec::kCans.kCan1)
             return;
 
 
+        // 只接受正常的 8 字节标准 CAN 数据帧
         if (
             data.is_extended_can_id
             || data.is_remote_transmission
             || data.can_data.size() != 8
-        )
+        ) {
             return;
+        }
 
 
-        // 参考 dji_motor.hpp 的 match_then_store_status()
+        // 参考 dji_motor.hpp：判断是不是当前 M3508 的反馈
         const bool matched =
             motor_.match_then_store_status(
                 data.can_id,
@@ -124,12 +150,32 @@ public:
             );
 
 
-        if (matched && !motor_feedback_found_) {
+        if (!matched)
+            return;
+
+
+        // 收到新反馈，超时计数重新清零
+        motor_feedback_age_cycles_ = 0;
+
+
+        // 第一帧反馈到来时进行一次启动零点校准
+        if (!motor_feedback_found_) {
+
             motor_feedback_found_ = true;
+
+
+            // calibrate_zero_point() 使用 last_raw_angle_
+            // 所以必须先解析一次刚收到的 CAN 数据
+            motor_.update_status();
+
+
+            // 将“程序启动时的当前位置”定义为 0 rad
+            motor_.calibrate_zero_point();
+
 
             RCLCPP_INFO(
                 get_logger(),
-                "M3508 feedback connected, CAN ID = 0x%03X",
+                "M3508 feedback connected and zero calibrated, CAN ID = 0x%03X",
                 static_cast<unsigned int>(data.can_id)
             );
         }
@@ -137,11 +183,18 @@ public:
 
 
 private:
-    // 参考任务二 command_update()，这里只负责把 control_torque 发给 C620
+    // ============================================================
+    // 向 C620 发送控制命令
+    // ============================================================
     void command_update() {
 
         auto builder =
             board_->start_transmit();
+
+
+        const bool motor_feedback_alive =
+            motor_feedback_found_
+            && motor_feedback_age_cycles_ <= kMotorFeedbackTimeoutCycles;
 
 
         builder.can_transmit(
@@ -152,13 +205,24 @@ private:
                 .can_data =
                     device::CanPacket8{
 
+                        // C620 ID 1
                         device::CanPacket8::PaddingQuarter{},
 
+                        // C620 ID 2
                         device::CanPacket8::PaddingQuarter{},
 
-                        // ID = 3，所以控制量放在第三个 Quarter
-                        motor_.generate_command(),
+                        // C620 ID 3：当前 M3508
+                        //
+                        // 反馈正常：
+                        // 从 /motor/control_torque 读取 PID 输出
+                        //
+                        // 反馈超时：
+                        // 强制发送 0 力矩
+                        motor_feedback_alive
+                            ? motor_.generate_command()
+                            : motor_.generate_command(0.0),
 
+                        // C620 ID 4
                         device::CanPacket8::PaddingQuarter{},
                     }
                         .as_bytes(),
@@ -172,19 +236,32 @@ private:
     > board_;
 
 
-    // Partner Component，负责执行 command_update()
+    // Partner Component：负责读取 /motor/control_torque 并发送 CAN
     std::shared_ptr<
         AngleMotorCommand
     > motor_command_;
 
 
-    // DjiMotor 会在当前 Component 输出状态，在 Partner 中读取 control_torque
+    // DjiMotor：
+    // 当前 Component 输出 angle / velocity
+    // Partner Component 输入 control_torque
     device::DjiMotor motor_;
 
 
+    // 是否至少收到过一帧电机反馈
     bool motor_feedback_found_ = false;
 
+
+    // 距离最后一帧电机反馈过去的控制周期数
+    std::uint32_t motor_feedback_age_cycles_ = 0;
+
+
     std::uint32_t log_counter_ = 0;
+
+
+    // update_rate = 1000 Hz
+    // 100 个周期约等于 100 ms
+    static constexpr std::uint32_t kMotorFeedbackTimeoutCycles = 100;
 };
 
 } // namespace rmcs_core::hardware
@@ -192,7 +269,7 @@ private:
 
 #include <pluginlib/class_list_macros.hpp>
 
-// 参考现有 RMCS hardware 的 pluginlib 导出方式
+// 注册为 RMCS Component
 PLUGINLIB_EXPORT_CLASS(
     rmcs_core::hardware::AngleMotorHardware,
     rmcs_executor::Component
