@@ -20,8 +20,8 @@ velocity_pid_controller:
     setpoint: /motor/target_velocity
     control: /motor/control_torque
 
-    kp: 0.05
-    ki: 0.0005
+    kp: 0.131875
+    ki: 0.00078125
     kd: 0.0
 
     integral_min: -100.0
