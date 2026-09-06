@@ -3,10 +3,10 @@ rmcs_executor:
     update_rate: 1000.0
 
     components:
-      # 电机硬件：输出 angle / velocity，并创建 command Partner
+      # 电机硬件和 command Partner
       - rmcs_core::hardware::AngleMotorHardware -> angle_motor_hardware
 
-      # ROS2 目标角度 -> 优弧角度误差
+      # ROS2 目标角度 -> 最短弧角度误差
       - rmcs_core::controller::AngleTargetController -> angle_target_controller
 
       # 外环：角度误差 -> 目标速度
@@ -15,57 +15,40 @@ rmcs_executor:
       # 内环：目标速度 - 实际速度 -> 控制力矩
       - rmcs_core::controller::pid::PidController -> velocity_pid_controller
 
-      # 把双环内部数据发布为 ROS2 Topic，方便调试
+      # 发布双环内部数据
       - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
-
 
 angle_motor_hardware:
   ros__parameters:
     board_serial: ""
 
-
 angle_target_controller:
   ros__parameters: {}
 
-
-# -----------------------------
 # 角度外环
-# -----------------------------
 angle_pid_controller:
   ros__parameters:
-
-    # AngleTargetController 已经算好了误差
+    # 最短弧角度误差 -> 目标速度
     measurement: /motor/control_angle_error
-
-    # 外环输出作为速度内环的目标速度
     control: /motor/control_velocity
 
-    # 第一版先只用 P，方便调试
     kp: 5.0
     ki: 0.0
     kd: 0.0
 
-    # 限制外环最大目标速度
+    # 目标速度限制
     output_min: -3.0
     output_max: 3.0
 
-
-# -----------------------------
 # 速度内环
-# -----------------------------
 velocity_pid_controller:
   ros__parameters:
-
-    # 实际电机速度
+    # 目标速度 - 实际速度 -> 控制力矩
     measurement: /motor/velocity
-
-    # 角度外环给出的目标速度
     setpoint: /motor/control_velocity
-
-    # 最终交给 AngleMotorCommand
     control: /motor/control_torque
 
-    # 减速箱实机调试后的速度环参数
+    # 实机验证参数
     kp: 1.0
     ki: 0.0005
     kd: 0.0
@@ -76,7 +59,7 @@ velocity_pid_controller:
     integral_split_min: -1.0
     integral_split_max: 1.0
 
-    # 先限制力矩，第一次实机更安全
+    # 力矩限制
     output_min: -0.2
     output_max: 0.2
 
@@ -86,11 +69,11 @@ value_broadcaster:
       # 角度外环输入
       - /motor/control_angle_error
 
-      # 角度外环输出，也是速度内环目标值
+      # 角度外环输出，也是速度内环目标
       - /motor/control_velocity
 
       # 电机真实速度
       - /motor/velocity
 
-      # 速度内环最终输出
+      # 速度内环输出
       - /motor/control_torque
