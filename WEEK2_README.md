@@ -10,6 +10,20 @@
 
 另外，为了减少手动反复调 PID 的工作量，又单独做了一个任务二 AutoTune 工具，用来自动执行阶跃测试和搜索 PI 参数。
 
+当前最终验收代码已经整理到 `main`：
+
+```text
+main
+├── WEEK2_README.md
+├── 任务二正式速度闭环与最终 PI 参数
+└── 任务三角度双环与优弧修正版
+
+experiment/task2-velocity-pid-autotune
+└── AutoTune 实验工具
+```
+
+因此只看本周最终任务代码时直接看 `main` 即可；想继续看自动调参实现时再切到实验分支。
+
 ---
 
 ## 1. 代码结构
@@ -225,7 +239,7 @@ AutoTune 不是题目要求必须实现的主体功能，是在任务二已经�
 
 ## 4.2 主要文件
 
-### [`tools/task2_pid_autotune/task2_pid_autotune.py`](tools/task2_pid_autotune/task2_pid_autotune.py)
+### [`tools/task2_pid_autotune/task2_pid_autotune.py`](https://github.com/winternpc/RMCS/blob/experiment/task2-velocity-pid-autotune/tools/task2_pid_autotune/task2_pid_autotune.py)
 
 主要负责 ROS2 和实机测试流程：
 
@@ -237,7 +251,7 @@ AutoTune 不是题目要求必须实现的主体功能，是在任务二已经�
 保存 CSV
 ```
 
-### [`tools/task2_pid_autotune/tuning_core.py`](tools/task2_pid_autotune/tuning_core.py)
+### [`tools/task2_pid_autotune/tuning_core.py`](https://github.com/winternpc/RMCS/blob/experiment/task2-velocity-pid-autotune/tools/task2_pid_autotune/tuning_core.py)
 
 主要负责：
 
@@ -260,7 +274,7 @@ Ki = 0.00078125
 
 这种连续数值。
 
-### [`dr16-motor-autotune.yaml`](rmcs_ws/src/rmcs_bringup/config/dr16-motor-autotune.yaml)
+### [`dr16-motor-autotune.yaml`](https://github.com/winternpc/RMCS/blob/experiment/task2-velocity-pid-autotune/rmcs_ws/src/rmcs_bringup/config/dr16-motor-autotune.yaml)
 
 调参专用配置。
 
@@ -506,22 +520,26 @@ CAN
 这次几个比较重要的提交：
 
 ```text
+36c071c2  docs: add week2 task code overview
 45e48b3b  feat: add task2 velocity PID autotuner
-f0bd311b  tune: update task2 velocity PI gains
-2139026d  fix: make task3 motor follow major arc
+1ade625f  tune: update task2 velocity PI gains
+79cc6160  fix: make task3 motor follow major arc
 ```
 
 对应：
 
 ```text
+36c071c2
+→ 把第二周代码说明加入 main
+
 45e48b3b
-→ 增加任务二 AutoTune 工具和调参入口
+→ 增加任务二 AutoTune 工具和调参入口（实验分支）
 
-f0bd311b
-→ 把最终选出的 8 rad/s PI 参数写回正式配置
+1ade625f
+→ 把最终选出的 8 rad/s PI 参数写回正式配置并合入 main
 
-2139026d
-→ 修正任务三优弧方向并使用连续长弧目标
+79cc6160
+→ 修正任务三优弧方向并使用连续长弧目标，已合入 main
 ```
 
 任务二 AutoTune 保留在实验分支：
@@ -530,11 +548,13 @@ f0bd311b
 experiment/task2-velocity-pid-autotune
 ```
 
-任务三优弧修正保留在：
+任务三优弧修正版已经合入：
 
 ```text
-fix/task3-major-arc
+main
 ```
+
+原来的 `fix/task3-major-arc` 分支仍可用于查看修复过程，但验收时直接看 `main` 即可。
 
 ---
 
