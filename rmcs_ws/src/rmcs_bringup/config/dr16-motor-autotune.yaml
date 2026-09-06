@@ -1,0 +1,39 @@
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    components:
+      - rmcs_core::hardware::Dr16MotorControl -> dr16_motor_control
+      - rmcs_core::controller::pid::PidController -> velocity_pid_controller
+      - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
+
+dr16_motor_control:
+  ros__parameters:
+    board_serial: ""
+    max_target_velocity: 10.0
+    velocity_filter_cutoff_hz: 10.0
+    autotune_mode: true
+
+velocity_pid_controller:
+  ros__parameters:
+    measurement: /motor/velocity_filtered
+    setpoint: /motor/target_velocity
+    control: /motor/control_torque
+
+    kp: 0.05
+    ki: 0.0005
+    kd: 0.0
+
+    integral_min: -100.0
+    integral_max: 100.0
+    integral_split_min: -1.0
+    integral_split_max: 1.0
+
+    output_min: -0.2
+    output_max: 0.2
+
+value_broadcaster:
+  ros__parameters:
+    forward_list:
+      - /motor/target_velocity
+      - /motor/velocity_filtered
+      - /motor/control_torque

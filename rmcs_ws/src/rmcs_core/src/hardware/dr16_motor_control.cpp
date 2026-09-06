@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -5,6 +6,7 @@
 
 #include <rclcpp/node.hpp>
 #include <rmcs_executor/component.hpp>
+#include <std_msgs/msg/float64.hpp>
 
 #include "filter/low_pass_filter.hpp"
 
@@ -48,6 +50,24 @@ public:
         max_target_velocity_ = get_parameter("max_target_velocity").as_double();
         velocity_filter_cutoff_hz_ =
             get_parameter("velocity_filter_cutoff_hz").as_double();
+        get_parameter_or("autotune_mode", autotune_mode_, false);
+
+        if (autotune_mode_) {
+            autotune_target_subscription_ =
+                create_subscription<std_msgs::msg::Float64>(
+                    "/motor/autotune_target_velocity",
+                    rclcpp::QoS{1}.reliable(),
+                    [this](std_msgs::msg::Float64::UniquePtr&& msg) {
+                        if (!std::isfinite(msg->data)) {
+                            autotune_target_received_ = false;
+                            return;
+                        }
+                        autotune_target_velocity_ = std::clamp(
+                            msg->data, -max_target_velocity_, max_target_velocity_);
+                        autotune_target_age_cycles_ = 0;
+                        autotune_target_received_ = true;
+                    });
+        }
 
         // 参考 deformable_suspension.cpp 的 LowPassFilter 用法
         velocity_filter_.set_cutoff(velocity_filter_cutoff_hz_, kUpdateFrequencyHz);
@@ -63,17 +83,25 @@ public:
         // 参考 flight.cpp 的 DR16 数据处理方式
         dr16_.update_status();
 
-        if (dr16_.valid()) {
+        if (autotune_mode_) {
+            if (autotune_target_received_
+                && autotune_target_age_cycles_ <= kAutotuneTargetTimeoutCycles) {
+                ++autotune_target_age_cycles_;
+            }
+            target_velocity_ = autotune_target_alive() ? autotune_target_velocity_ : 0.0;
+            *target_velocity_output_ = target_velocity_;
+        } else if (dr16_.valid()) {
             const double joystick_y = dr16_.joystick_left().y();
 
             // 左摇杆 Y 映射目标速度，5% 死区内视为回中。
             target_velocity_ = std::abs(joystick_y) < kJoystickDeadzone
                 ? 0.0
                 : joystick_y * max_target_velocity_;
+            *target_velocity_output_ = target_velocity_;
         } else {
             target_velocity_ = 0.0;
+            *target_velocity_output_ = kNan;
         }
-        *target_velocity_output_ = dr16_.valid() ? target_velocity_ : kNan;
 
         if (motor_feedback_found_
             && motor_feedback_age_cycles_ <= kMotorFeedbackTimeoutCycles) {
@@ -117,7 +145,9 @@ public:
         const bool motor_feedback_alive =
             motor_feedback_found_
             && motor_feedback_age_cycles_ <= kMotorFeedbackTimeoutCycles;
-        const bool control_allowed = dr16_.valid() && motor_feedback_alive;
+        const bool target_source_alive =
+            autotune_mode_ ? autotune_target_alive() : dr16_.valid();
+        const bool control_allowed = target_source_alive && motor_feedback_alive;
 
         // 安全门控不通过时，显式向 C620 发送零控制量。
         builder.can_transmit(
@@ -173,9 +203,15 @@ public:
     }
 
 private:
+    bool autotune_target_alive() const {
+        return autotune_target_received_
+            && autotune_target_age_cycles_ <= kAutotuneTargetTimeoutCycles;
+    }
+
     static constexpr double kUpdateFrequencyHz = 1000.0;
     static constexpr double kJoystickDeadzone = 0.05;
     static constexpr std::uint32_t kMotorFeedbackTimeoutCycles = 100;
+    static constexpr std::uint32_t kAutotuneTargetTimeoutCycles = 200;
     static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
     double max_target_velocity_ = 0.0;
@@ -183,6 +219,7 @@ private:
     double velocity_filter_cutoff_hz_ = 0.0;
     double raw_velocity_ = 0.0;
     double filtered_velocity_ = 0.0;
+    double autotune_target_velocity_ = 0.0;
 
     filter::LowPassFilter<1> velocity_filter_{1.0};
 
@@ -191,9 +228,13 @@ private:
 
     bool dbus_packet_found_ = false;
     bool motor_feedback_found_ = false;
+    bool autotune_mode_ = false;
+    bool autotune_target_received_ = false;
+    std::uint32_t autotune_target_age_cycles_ = kAutotuneTargetTimeoutCycles + 1;
     std::uint32_t motor_feedback_age_cycles_ = kMotorFeedbackTimeoutCycles + 1;
     std::uint32_t status_log_counter_ = 0;
 
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr autotune_target_subscription_;
     std::unique_ptr<librmcs::board::CBoard> board_;
     device::Dr16 dr16_;
     std::shared_ptr<Dr16MotorCommand> motor_command_;
